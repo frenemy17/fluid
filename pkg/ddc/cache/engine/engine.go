@@ -53,12 +53,13 @@ type CacheEngine struct {
 	name      string
 	namespace string
 
-	syncRetryDuration            time.Duration
-	timeOfLastSync               time.Time
-	tieredStoreWarningInterval   time.Duration
-	timeOfLastTieredStoreWarning time.Time
-	retryShutdown                int32
-	gracefulShutdownLimits       int32
+	syncRetryDuration                  time.Duration
+	timeOfLastSync                     time.Time
+	tieredStoreWarningInterval         time.Duration
+	timeOfLastTieredStoreWarning       time.Time
+	timeOfLastClientTieredStoreWarning time.Time
+	retryShutdown                      int32
+	gracefulShutdownLimits             int32
 
 	runtimeType string
 	engineImpl  string

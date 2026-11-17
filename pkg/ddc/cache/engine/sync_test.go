@@ -1413,10 +1413,12 @@ var _ = Describe("CacheEngine Sync Tests", Label("pkg.ddc.cache.engine.sync_test
 			var fakeRecorder *record.FakeRecorder
 
 			createWorkerWithTieredStore := func(tieredStore datav1alpha1.RuntimeTieredStore) {
-				runtimeObj.Spec.Worker.TieredStore = tieredStore
-				Expect(fakeClient.Update(ctx.Context, runtimeObj)).To(Succeed())
-
 				rt, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				rt.Spec.Worker.TieredStore = tieredStore
+				Expect(fakeClient.Update(ctx.Context, rt)).To(Succeed())
+
+				rt, err = engine.getRuntime()
 				Expect(err).NotTo(HaveOccurred())
 				value, err := engine.transform(dataset, rt, runtimeClass)
 				Expect(err).NotTo(HaveOccurred())
@@ -1429,10 +1431,30 @@ var _ = Describe("CacheEngine Sync Tests", Label("pkg.ddc.cache.engine.sync_test
 				Expect(err).NotTo(HaveOccurred())
 			}
 
+			createClientWithTieredStore := func(tieredStore datav1alpha1.RuntimeTieredStore) {
+				rt, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				rt.Spec.Client.TieredStore = tieredStore
+				Expect(fakeClient.Update(ctx.Context, rt)).To(Succeed())
+
+				rt, err = engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				value, err := engine.transform(dataset, rt, runtimeClass)
+				Expect(err).NotTo(HaveOccurred())
+
+				key := types.NamespacedName{Name: "test-runtime-client", Namespace: "default"}
+				seeded := &appsv1.DaemonSet{}
+				Expect(fakeClient.Get(ctx.Context, key, seeded)).To(Succeed())
+				Expect(fakeClient.Delete(ctx.Context, seeded)).To(Succeed())
+				_, err = engine.SetupClientComponent(value.Client)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
 			BeforeEach(func() {
 				fakeRecorder = record.NewFakeRecorder(100)
 				engine.Recorder = fakeRecorder
 				engine.timeOfLastTieredStoreWarning = time.Time{}
+				engine.timeOfLastClientTieredStoreWarning = time.Time{}
 			})
 
 			It("should not emit a warning event when tiered store matches worker pod volumes", func() {
@@ -1807,6 +1829,271 @@ var _ = Describe("CacheEngine Sync Tests", Label("pkg.ddc.cache.engine.sync_test
 				err := engine.syncRuntimeSpec(ctx, runtimeObj, runtimeClass)
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("not found"))
+			})
+
+			It("should return error when reading client pod spec fails", func() {
+				key := types.NamespacedName{Name: "test-runtime-client", Namespace: "default"}
+				clientDs := &appsv1.DaemonSet{}
+				Expect(fakeClient.Get(ctx.Context, key, clientDs)).To(Succeed())
+				Expect(fakeClient.Delete(ctx.Context, clientDs)).To(Succeed())
+
+				err := engine.syncRuntimeSpec(ctx, runtimeObj, runtimeClass)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("not found"))
+			})
+
+			It("should not emit a warning event when tiered store matches client pod volumes", func() {
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{ProcessMemory: &datav1alpha1.ProcessMemoryMediumSource{Quota: resource.MustParse("8Gi")}},
+						{EmptyDir: &datav1alpha1.EmptyDirMediumSource{Quota: resource.MustParse("50Gi"), Medium: corev1.StorageMediumMemory}},
+					},
+				})
+
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+
+				Expect(fakeRecorder.Events).To(BeEmpty())
+			})
+
+			It("should emit a Warning event when processMemory quota in spec drifts from client volume sizeLimit", func() {
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{ProcessMemory: &datav1alpha1.ProcessMemoryMediumSource{Quota: resource.MustParse("8Gi")}},
+					},
+				})
+
+				// Edit spec quota to 16Gi
+				edited, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				edited.Spec.Client.TieredStore.Levels[0].ProcessMemory.Quota = resource.MustParse("16Gi")
+				Expect(fakeClient.Update(ctx.Context, edited)).To(Succeed())
+
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+
+				var event string
+				Expect(fakeRecorder.Events).To(Receive(&event))
+				Expect(event).To(ContainSubstring(corev1.EventTypeWarning))
+				Expect(event).To(ContainSubstring(common.RuntimeTieredStoreConflict))
+				Expect(event).To(ContainSubstring("Client tieredStore cannot be updated in-place after creation"))
+				Expect(event).To(ContainSubstring("level 0 (processMemory): spec quota 16Gi does not match client volume tiered-store-level-0-memory sizeLimit 8Gi"))
+				Expect(event).To(ContainSubstring("Delete and recreate the client DaemonSet or the CacheRuntime to apply changes."))
+			})
+
+			It("should emit a Warning event when emptyDir quota in spec drifts from client volume sizeLimit", func() {
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{EmptyDir: &datav1alpha1.EmptyDirMediumSource{
+							Quota:  resource.MustParse("20Gi"),
+							Medium: corev1.StorageMediumMemory,
+						}},
+					},
+				})
+
+				edited, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				edited.Spec.Client.TieredStore.Levels[0].EmptyDir.Quota = resource.MustParse("40Gi")
+				Expect(fakeClient.Update(ctx.Context, edited)).To(Succeed())
+
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+
+				var event string
+				Expect(fakeRecorder.Events).To(Receive(&event))
+				Expect(event).To(ContainSubstring(corev1.EventTypeWarning))
+				Expect(event).To(ContainSubstring(common.RuntimeTieredStoreConflict))
+				Expect(event).To(ContainSubstring("Client tieredStore cannot be updated in-place after creation"))
+				Expect(event).To(ContainSubstring("level 0 (emptyDir): spec quota 40Gi does not match client volume tiered-store-level-0-index-0 sizeLimit 20Gi"))
+			})
+
+			It("should emit a Warning event when emptyDir medium is edited on client", func() {
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{EmptyDir: &datav1alpha1.EmptyDirMediumSource{
+							Quota:  resource.MustParse("50Gi"),
+							Medium: "",
+						}},
+					},
+				})
+
+				edited, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				edited.Spec.Client.TieredStore.Levels[0].EmptyDir.Medium = corev1.StorageMediumMemory
+				Expect(fakeClient.Update(ctx.Context, edited)).To(Succeed())
+
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+
+				var event string
+				Expect(fakeRecorder.Events).To(Receive(&event))
+				Expect(event).To(ContainSubstring(corev1.EventTypeWarning))
+				Expect(event).To(ContainSubstring(common.RuntimeTieredStoreConflict))
+				Expect(event).To(ContainSubstring(`level 0 (emptyDir): spec medium "Memory" does not match client volume tiered-store-level-0-index-0 medium ""`))
+				Expect(event).To(ContainSubstring("Delete and recreate the client DaemonSet or the CacheRuntime to apply changes."))
+			})
+
+			It("should emit a Warning event when hostPath is modified on client", func() {
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{HostPath: &datav1alpha1.HostPathMediumSource{
+							Paths:  []string{"/mnt/cache1"},
+							Quotas: []resource.Quantity{resource.MustParse("100Gi")},
+						}},
+					},
+				})
+
+				edited, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				edited.Spec.Client.TieredStore.Levels[0].HostPath.Paths = []string{"/mnt/cache2"}
+				Expect(fakeClient.Update(ctx.Context, edited)).To(Succeed())
+
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+
+				var event string
+				Expect(fakeRecorder.Events).To(Receive(&event))
+				Expect(event).To(ContainSubstring(corev1.EventTypeWarning))
+				Expect(event).To(ContainSubstring(common.RuntimeTieredStoreConflict))
+				Expect(event).To(ContainSubstring("level 0 path 0 (hostPath): spec path /mnt/cache2 does not match client volume tiered-store-level-0-index-0 path /mnt/cache1"))
+			})
+
+			It("should emit separate warning events when both worker and client drift", func() {
+				createWorkerWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{ProcessMemory: &datav1alpha1.ProcessMemoryMediumSource{Quota: resource.MustParse("8Gi")}},
+					},
+				})
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{ProcessMemory: &datav1alpha1.ProcessMemoryMediumSource{Quota: resource.MustParse("4Gi")}},
+					},
+				})
+
+				edited, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				edited.Spec.Worker.TieredStore.Levels[0].ProcessMemory.Quota = resource.MustParse("16Gi")
+				edited.Spec.Client.TieredStore.Levels[0].ProcessMemory.Quota = resource.MustParse("8Gi")
+				Expect(fakeClient.Update(ctx.Context, edited)).To(Succeed())
+
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+
+				events := []string{}
+				for len(fakeRecorder.Events) > 0 {
+					var ev string
+					Expect(fakeRecorder.Events).To(Receive(&ev))
+					events = append(events, ev)
+				}
+				Expect(events).To(HaveLen(2))
+				Expect(events[0]).To(ContainSubstring("Worker tieredStore cannot be updated in-place"))
+				Expect(events[1]).To(ContainSubstring("Client tieredStore cannot be updated in-place"))
+			})
+
+			It("should throttle client warning events according to interval", func() {
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{ProcessMemory: &datav1alpha1.ProcessMemoryMediumSource{Quota: resource.MustParse("8Gi")}},
+					},
+				})
+
+				edited, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				edited.Spec.Client.TieredStore.Levels[0].ProcessMemory.Quota = resource.MustParse("16Gi")
+				Expect(fakeClient.Update(ctx.Context, edited)).To(Succeed())
+
+				// First sync emits event
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+				Expect(fakeRecorder.Events).To(Receive())
+
+				// Immediate second sync is throttled
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+				Expect(fakeRecorder.Events).To(BeEmpty())
+
+				// After interval elapses, next sync emits event again
+				engine.timeOfLastClientTieredStoreWarning = time.Now().Add(-11 * time.Minute)
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+				Expect(fakeRecorder.Events).To(Receive())
+			})
+
+			It("should reset client throttling cooldown once drift is resolved", func() {
+				createClientWithTieredStore(datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{ProcessMemory: &datav1alpha1.ProcessMemoryMediumSource{Quota: resource.MustParse("8Gi")}},
+					},
+				})
+
+				// Cause drift and sync
+				edited, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				edited.Spec.Client.TieredStore.Levels[0].ProcessMemory.Quota = resource.MustParse("16Gi")
+				Expect(fakeClient.Update(ctx.Context, edited)).To(Succeed())
+
+				syncRuntime, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+				Expect(fakeRecorder.Events).To(Receive())
+				Expect(engine.timeOfLastClientTieredStoreWarning).NotTo(BeZero())
+
+				// Resolve drift (revert spec back to 8Gi matching pod volume)
+				reverted, err := engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				reverted.Spec.Client.TieredStore.Levels[0].ProcessMemory.Quota = resource.MustParse("8Gi")
+				Expect(fakeClient.Update(ctx.Context, reverted)).To(Succeed())
+
+				syncRuntime, err = engine.getRuntime()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(engine.syncRuntimeSpec(ctx, syncRuntime, runtimeClass)).To(Succeed())
+				Expect(fakeRecorder.Events).To(BeEmpty())
+				Expect(engine.timeOfLastClientTieredStoreWarning).To(BeZero())
+			})
+
+			It("should return gracefully from checkClientTieredStoreDrift when podSpec is nil", func() {
+				engine.checkClientTieredStoreDrift(runtimeObj, nil)
+				Expect(fakeRecorder.Events).To(BeEmpty())
+			})
+
+			It("should detect missing volume for processMemory level on client", func() {
+				runtimeWithPM := runtimeObj.DeepCopy()
+				runtimeWithPM.Spec.Client.TieredStore = datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{ProcessMemory: &datav1alpha1.ProcessMemoryMediumSource{Quota: resource.MustParse("8Gi")}},
+					},
+				}
+				emptyPodSpec := &corev1.PodSpec{}
+				engine.checkClientTieredStoreDrift(runtimeWithPM, emptyPodSpec)
+
+				var event string
+				Expect(fakeRecorder.Events).To(Receive(&event))
+				Expect(event).To(ContainSubstring(corev1.EventTypeWarning))
+				Expect(event).To(ContainSubstring("level 0 (processMemory): volume tiered-store-level-0-memory not found or missing sizeLimit in client pod"))
+			})
+
+			It("should detect missing volume for hostPath level on client", func() {
+				runtimeWithHP := runtimeObj.DeepCopy()
+				runtimeWithHP.Spec.Client.TieredStore = datav1alpha1.RuntimeTieredStore{
+					Levels: []datav1alpha1.RuntimeTieredStoreLevel{
+						{HostPath: &datav1alpha1.HostPathMediumSource{
+							Paths:  []string{"/mnt/disk1"},
+							Quotas: []resource.Quantity{resource.MustParse("100Gi")},
+						}},
+					},
+				}
+				emptyPodSpec := &corev1.PodSpec{}
+				engine.checkClientTieredStoreDrift(runtimeWithHP, emptyPodSpec)
+
+				var event string
+				Expect(fakeRecorder.Events).To(Receive(&event))
+				Expect(event).To(ContainSubstring(corev1.EventTypeWarning))
+				Expect(event).To(ContainSubstring("level 0 path 0 (hostPath): volume tiered-store-level-0-index-0 not found in client pod"))
 			})
 		})
 	})
