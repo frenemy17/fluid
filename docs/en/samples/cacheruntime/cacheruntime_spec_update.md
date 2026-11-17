@@ -253,16 +253,16 @@ kubectl get cm fluid-runtime-class-snapshot-my-cache -o jsonpath='{.data.runtime
 
 **Any field not listed in section 3 cannot be updated after creation**; changes to it are not propagated to the AdvancedStatefulSet.
 
-### 5.1 Worker Tiered Storage (`spec.worker.tieredStore`)
+### 5.1 Worker and Client Tiered Storage (`spec.worker.tieredStore`, `spec.client.tieredStore`)
 
-**Field path**: `spec.worker.tieredStore`
+**Field paths**: `spec.worker.tieredStore`, `spec.client.tieredStore`
 
-- **Why in-place updates are not supported**: Tiered storage volumes (`emptyDir.sizeLimit`, memory tmpfs `/dev/shm`, hostPath mounts) and container memory adjustments are generated during initial creation (`Setup`). In Kubernetes, pod volume definitions and volume `sizeLimit` properties cannot be modified dynamically in running pods.
-- **Drift warning behavior**: While editing `spec.worker.tieredStore` updates the runtime configuration ConfigMap, the running worker pods retain their creation-time volume configurations and limits. When `spec.worker.tieredStore` quotas or paths diverge from the worker pod volumes, the controller detects the split during reconciliation and emits a `RuntimeTieredStoreConflict` Warning event on the `CacheRuntime`:
+- **Why in-place updates are not supported**: Tiered storage volumes (`emptyDir.sizeLimit`, memory tmpfs `/dev/shm`, hostPath mounts) and container memory adjustments are generated during initial creation (`Setup`). In Kubernetes, pod volume definitions and volume `sizeLimit` properties cannot be modified dynamically in running pods. Furthermore, the client component runs as a DaemonSet which does not support in-place updates.
+- **Drift warning behavior**: While editing `spec.worker.tieredStore` or `spec.client.tieredStore` updates the runtime configuration ConfigMap, the running worker and client pods retain their creation-time volume configurations and limits. When `spec.worker.tieredStore` or `spec.client.tieredStore` quotas or paths diverge from the running pod volumes, the controller detects the split during reconciliation and emits a `RuntimeTieredStoreConflict` Warning event on the `CacheRuntime`:
   ```bash
   kubectl get events -n <namespace> --field-selector type=Warning,reason=RuntimeTieredStoreConflict
   ```
-- **How to apply changes**: Changes to `spec.worker.tieredStore` require deleting and recreating the CacheRuntime to take effect.
+- **How to apply changes**: Changes to `spec.worker.tieredStore` require deleting and recreating the CacheRuntime. Changes to `spec.client.tieredStore` require deleting and recreating the client DaemonSet or the CacheRuntime to take effect.
 
 ---
 
@@ -274,12 +274,13 @@ kubectl get cm fluid-runtime-class-snapshot-my-cache -o jsonpath='{.data.runtime
 | `resources` | ✅ Yes | Automatically synced to AdvancedStatefulSet (recreates the Pods) |
 | `replicas` | ✅ Yes | Automatically synced to AdvancedStatefulSet (scaling in discards that Worker's cache) |
 | `spec.worker.tieredStore` | ❌ No | Emits `RuntimeTieredStoreConflict` Warning event on drift; requires deleting and recreating CacheRuntime |
+| `spec.client.tieredStore` | ❌ No | Emits `RuntimeTieredStoreConflict` Warning event on drift; requires deleting and recreating client DaemonSet or CacheRuntime |
 | All other fields | ❌ No | Not synced; redeployment required |
 
 **Key Takeaways**:
 1. The current version supports dynamic updates for `runtimeVersion`, `resources` and `replicas`.
 2. An image-only `runtimeVersion` update restarts the affected container in the same Pod. Its in-process cache is lost, and its `emptyDir` cache survives. A `resources` change recreates the Pod, so both caches are lost.
 3. In cgroupv1 environments, `runtimeVersion` and `resources` must be updated separately (step-by-step); `replicas` is not subject to this limitation.
-4. `spec.worker.tieredStore` cannot be updated in place; modifying it causes volume drift and emits a `RuntimeTieredStoreConflict` Warning event. Deleting and recreating the CacheRuntime is required.
+4. `spec.worker.tieredStore` and `spec.client.tieredStore` cannot be updated in place; modifying them causes volume drift and emits a `RuntimeTieredStoreConflict` Warning event. Deleting and recreating the CacheRuntime (or client DaemonSet for client changes) is required.
 5. Modifications to other fields will not take effect and require redeployment.
 6. A CacheRuntime is bound to its CacheRuntimeClass as it was when the CacheRuntime was set up; editing the class only affects CacheRuntimes created afterwards.

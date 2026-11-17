@@ -307,8 +307,25 @@ func (e *CacheEngine) syncRuntimeSpec(ctx cruntime.ReconcileRequestContext, runt
 		}
 	}
 
-	// Note: Client component is NOT synced here because it uses DaemonSet which does not support in-place update
-	// Client component will be recreated when spec changes
+	// Client component uses DaemonSet and does NOT support in-place update.
+	// However, if spec.client.tieredStore is edited, the runtime config ConfigMap
+	// is recomputed while the client DaemonSet's volumes remain unchanged.
+	// Detect and report any drift between spec.client.tieredStore and the client pod volumes.
+	clientNeedsSpec := len(runtime.Spec.Client.TieredStore.Levels) > 0 || !e.timeOfLastClientTieredStoreWarning.IsZero()
+	if runtimeClass.Topology.Client != nil && !runtime.Spec.Client.Disabled && clientNeedsSpec {
+		clientIdentity := &common.ComponentIdentity{
+			Name:      common.GetCacheComponentName(e.name, common.ComponentTypeClient),
+			Namespace: e.namespace,
+		}
+		manager := component.NewComponentHelper(common.ComponentTypeClient, e.Client)
+		podSpec, err := manager.GetPodSpec(ctx.Context, clientIdentity)
+		if err != nil {
+			e.Log.Error(err, "failed to read the client pod spec", "component", clientIdentity.Name)
+			return conflictMessages, err
+		}
+
+		e.checkClientTieredStoreDrift(runtime, podSpec)
+	}
 
 	return conflictMessages, nil
 }
@@ -336,41 +353,7 @@ func (e *CacheEngine) checkWorkerTieredStoreDrift(runtime *datav1alpha1.CacheRun
 		return
 	}
 
-	var driftMsgs []string
-	expectedVolumes := make(map[string]bool)
-
-	for levelIndex, level := range runtime.Spec.Worker.TieredStore.Levels {
-		switch {
-		case level.ProcessMemory != nil:
-			volName, msg := checkProcessMemoryDrift(levelIndex, level, podSpec.Volumes)
-			expectedVolumes[volName] = true
-			if msg != "" {
-				driftMsgs = append(driftMsgs, msg)
-			}
-		case level.HostPath != nil:
-			volNames, msgs := checkHostPathDrift(levelIndex, level, podSpec.Volumes)
-			for _, vn := range volNames {
-				expectedVolumes[vn] = true
-			}
-			driftMsgs = append(driftMsgs, msgs...)
-		case level.EmptyDir != nil:
-			volName, msg := checkEmptyDirDrift(levelIndex, level, podSpec.Volumes)
-			expectedVolumes[volName] = true
-			if msg != "" {
-				driftMsgs = append(driftMsgs, msg)
-			}
-		}
-	}
-
-	// Check for orphaned tiered store volumes on the worker pod that are no longer declared in spec.
-	// Only check engine-generated tiered store volume names (tiered-store-level-<N>-index-<M> or tiered-store-level-<N>-memory)
-	// to avoid false-positive collisions with user-supplied volumes sharing the prefix (e.g. tiered-store-level-config).
-	for _, vol := range podSpec.Volumes {
-		if isGeneratedTieredStoreVolumeName(vol.Name) && !expectedVolumes[vol.Name] {
-			driftMsgs = append(driftMsgs, fmt.Sprintf("worker pod volume %s is not declared in spec tieredStore", vol.Name))
-		}
-	}
-
+	driftMsgs := checkTieredStoreVolumesDrift("worker", runtime.Spec.Worker.TieredStore.Levels, podSpec.Volumes)
 	if len(driftMsgs) == 0 {
 		e.timeOfLastTieredStoreWarning = time.Time{}
 		return
@@ -387,34 +370,99 @@ func (e *CacheEngine) checkWorkerTieredStoreDrift(runtime *datav1alpha1.CacheRun
 	}
 }
 
-func checkProcessMemoryDrift(levelIndex int, level datav1alpha1.RuntimeTieredStoreLevel, podVolumes []corev1.Volume) (string, string) {
+// checkClientTieredStoreDrift detects whether the client pod's tiered store volumes match
+// the quotas declared in runtime.Spec.Client.TieredStore. Because client DaemonSet volumes cannot
+// be updated in-place without recreation, any split between the spec (recomputed into
+// the runtime ConfigMap) and the client pod volume sizeLimits is reported as a Warning event.
+func (e *CacheEngine) checkClientTieredStoreDrift(runtime *datav1alpha1.CacheRuntime, podSpec *corev1.PodSpec) {
+	if podSpec == nil {
+		return
+	}
+
+	driftMsgs := checkTieredStoreVolumesDrift("client", runtime.Spec.Client.TieredStore.Levels, podSpec.Volumes)
+	if len(driftMsgs) == 0 {
+		e.timeOfLastClientTieredStoreWarning = time.Time{}
+		return
+	}
+
+	interval := e.getTieredStoreWarningInterval()
+	if e.timeOfLastClientTieredStoreWarning.IsZero() || time.Since(e.timeOfLastClientTieredStoreWarning) >= interval {
+		msg := fmt.Sprintf("Client tieredStore cannot be updated in-place after creation: %s. Delete and recreate the client DaemonSet or the CacheRuntime to apply changes.", strings.Join(driftMsgs, "; "))
+		e.Log.Info("client tieredStore drift detected", "reasons", driftMsgs)
+		if e.Recorder != nil {
+			e.Recorder.Eventf(runtime, corev1.EventTypeWarning, common.RuntimeTieredStoreConflict, "%s", msg)
+		}
+		e.timeOfLastClientTieredStoreWarning = time.Now()
+	}
+}
+
+func checkTieredStoreVolumesDrift(componentName string, levels []datav1alpha1.RuntimeTieredStoreLevel, podVolumes []corev1.Volume) []string {
+	var driftMsgs []string
+	expectedVolumes := make(map[string]bool)
+
+	for levelIndex, level := range levels {
+		switch {
+		case level.ProcessMemory != nil:
+			volName, msg := checkProcessMemoryDrift(componentName, levelIndex, level, podVolumes)
+			expectedVolumes[volName] = true
+			if msg != "" {
+				driftMsgs = append(driftMsgs, msg)
+			}
+		case level.HostPath != nil:
+			volNames, msgs := checkHostPathDrift(componentName, levelIndex, level, podVolumes)
+			for _, vn := range volNames {
+				expectedVolumes[vn] = true
+			}
+			driftMsgs = append(driftMsgs, msgs...)
+		case level.EmptyDir != nil:
+			volName, msg := checkEmptyDirDrift(componentName, levelIndex, level, podVolumes)
+			expectedVolumes[volName] = true
+			if msg != "" {
+				driftMsgs = append(driftMsgs, msg)
+			}
+		}
+	}
+
+	// Check for orphaned tiered store volumes on the pod that are no longer declared in spec.
+	// Only check engine-generated tiered store volume names (tiered-store-level-<N>-index-<M> or tiered-store-level-<N>-memory)
+	// to avoid false-positive collisions with user-supplied volumes sharing the prefix (e.g. tiered-store-level-config).
+	for _, vol := range podVolumes {
+		if isGeneratedTieredStoreVolumeName(vol.Name) && !expectedVolumes[vol.Name] {
+			driftMsgs = append(driftMsgs, fmt.Sprintf("%s pod volume %s is not declared in spec tieredStore", componentName, vol.Name))
+		}
+	}
+
+	return driftMsgs
+}
+
+func checkProcessMemoryDrift(componentName string, levelIndex int, level datav1alpha1.RuntimeTieredStoreLevel, podVolumes []corev1.Volume) (string, string) {
 	volName := getMemoryTieredStoreVolumeName(levelIndex)
 	vol := findVolume(podVolumes, volName)
 	if vol == nil || vol.EmptyDir == nil || vol.EmptyDir.SizeLimit == nil {
-		return volName, fmt.Sprintf("level %d (processMemory): volume %s not found or missing sizeLimit in worker pod", levelIndex, volName)
+		return volName, fmt.Sprintf("level %d (processMemory): volume %s not found or missing sizeLimit in %s pod", levelIndex, volName, componentName)
 	}
 	if vol.EmptyDir.SizeLimit.Cmp(level.ProcessMemory.Quota) != 0 {
-		return volName, fmt.Sprintf("level %d (processMemory): spec quota %s does not match worker volume %s sizeLimit %s", levelIndex, level.ProcessMemory.Quota.String(), volName, vol.EmptyDir.SizeLimit.String())
+		return volName, fmt.Sprintf("level %d (processMemory): spec quota %s does not match %s volume %s sizeLimit %s", levelIndex, level.ProcessMemory.Quota.String(), componentName, volName, vol.EmptyDir.SizeLimit.String())
 	}
 	return volName, ""
 }
 
-func checkEmptyDirDrift(levelIndex int, level datav1alpha1.RuntimeTieredStoreLevel, podVolumes []corev1.Volume) (string, string) {
+func checkEmptyDirDrift(componentName string, levelIndex int, level datav1alpha1.RuntimeTieredStoreLevel, podVolumes []corev1.Volume) (string, string) {
 	volName := getTieredStoreVolumeName(levelIndex, 0)
 	vol := findVolume(podVolumes, volName)
 	if vol == nil || vol.EmptyDir == nil || vol.EmptyDir.SizeLimit == nil {
-		return volName, fmt.Sprintf("level %d (emptyDir): volume %s not found or missing sizeLimit in worker pod", levelIndex, volName)
+		return volName, fmt.Sprintf("level %d (emptyDir): volume %s not found or missing sizeLimit in %s pod", levelIndex, volName, componentName)
 	}
 	if vol.EmptyDir.Medium != level.EmptyDir.Medium {
-		return volName, fmt.Sprintf("level %d (emptyDir): spec medium %q does not match worker volume %s medium %q", levelIndex, string(level.EmptyDir.Medium), volName, string(vol.EmptyDir.Medium))
+		return volName, fmt.Sprintf("level %d (emptyDir): spec medium %q does not match %s volume %s medium %q", levelIndex, string(level.EmptyDir.Medium), componentName, volName, string(vol.EmptyDir.Medium))
 	}
 	if vol.EmptyDir.SizeLimit.Cmp(level.EmptyDir.Quota) != 0 {
-		return volName, fmt.Sprintf("level %d (emptyDir): spec quota %s does not match worker volume %s sizeLimit %s", levelIndex, level.EmptyDir.Quota.String(), volName, vol.EmptyDir.SizeLimit.String())
+		return volName, fmt.Sprintf("level %d (emptyDir): spec quota %s does not match %s volume %s sizeLimit %s", levelIndex, level.EmptyDir.Quota.String(), componentName, volName, vol.EmptyDir.SizeLimit.String())
 	}
 	return volName, ""
 }
 
-func checkHostPathDrift(levelIndex int, level datav1alpha1.RuntimeTieredStoreLevel, podVolumes []corev1.Volume) ([]string, []string) {
+func checkHostPathDrift(componentName string, levelIndex int, level datav1alpha1.RuntimeTieredStoreLevel, podVolumes []corev1.Volume) ([]string, []string) {
 	var volNames []string
 	var msgs []string
 	for pathIndex, path := range level.HostPath.Paths {
@@ -422,9 +470,9 @@ func checkHostPathDrift(levelIndex int, level datav1alpha1.RuntimeTieredStoreLev
 		volNames = append(volNames, volName)
 		vol := findVolume(podVolumes, volName)
 		if vol == nil || vol.HostPath == nil {
-			msgs = append(msgs, fmt.Sprintf("level %d path %d (hostPath): volume %s not found in worker pod", levelIndex, pathIndex, volName))
+			msgs = append(msgs, fmt.Sprintf("level %d path %d (hostPath): volume %s not found in %s pod", levelIndex, pathIndex, volName, componentName))
 		} else if vol.HostPath.Path != path {
-			msgs = append(msgs, fmt.Sprintf("level %d path %d (hostPath): spec path %s does not match worker volume %s path %s", levelIndex, pathIndex, path, volName, vol.HostPath.Path))
+			msgs = append(msgs, fmt.Sprintf("level %d path %d (hostPath): spec path %s does not match %s volume %s path %s", levelIndex, pathIndex, path, componentName, volName, vol.HostPath.Path))
 		}
 	}
 	return volNames, msgs

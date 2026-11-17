@@ -244,16 +244,16 @@ kubectl get cm fluid-runtime-class-snapshot-my-cache -o jsonpath='{.data.runtime
 
 **第 3 节未列出的字段一律不支持在创建后更新**，修改后不会同步到 AdvancedStatefulSet。
 
-### 5.1 Worker 分层存储 (`spec.worker.tieredStore`)
+### 5.1 Worker 与 Client 分层存储 (`spec.worker.tieredStore`, `spec.client.tieredStore`)
 
-**字段路径**: `spec.worker.tieredStore`
+**字段路径**: `spec.worker.tieredStore`, `spec.client.tieredStore`
 
-- **为什么不支持原地更新**：分层存储的 Volume 定义（`emptyDir.sizeLimit`、内存 tmpfs `/dev/shm`、hostPath 挂载等）以及容器内存计算在 Worker 初次创建时（`Setup`）完成生成。在 Kubernetes 中，运行中 Pod 的 Volume 定义和 `sizeLimit` 无法动态修改。
-- **配置漂移告警行为**：虽然修改 `spec.worker.tieredStore` 会同步更新 ConfigMap 中的运行时配置，但运行中的 Worker Pod 仍保持创建时的 Volume 大小和限制。当 `spec.worker.tieredStore` 中的配额或路径与 Worker Pod 发生分歧（漂移）时，Controller 会在调谐循环中检测到该状态，并在 `CacheRuntime` 对象上发出 `RuntimeTieredStoreConflict` Warning 事件：
+- **为什么不支持原地更新**：分层存储的 Volume 定义（`emptyDir.sizeLimit`、内存 tmpfs `/dev/shm`、hostPath 挂载等）以及容器内存计算在组件初次创建时（`Setup`）完成生成。在 Kubernetes 中，运行中 Pod 的 Volume 定义和 `sizeLimit` 无法动态修改；且 Client 组件以 DaemonSet 形式运行，不支持原地更新。
+- **配置漂移告警行为**：虽然修改 `spec.worker.tieredStore` 或 `spec.client.tieredStore` 会同步更新 ConfigMap 中的运行时配置，但运行中的 Worker 与 Client Pod 仍保持创建时的 Volume 大小和限制。当 `spec.worker.tieredStore` 或 `spec.client.tieredStore` 中的配额或路径与 Pod 发生分歧（漂移）时，Controller 会在调谐循环中检测到该状态，并在 `CacheRuntime` 对象上发出 `RuntimeTieredStoreConflict` Warning 事件：
   ```bash
   kubectl get events -n <namespace> --field-selector type=Warning,reason=RuntimeTieredStoreConflict
   ```
-- **如何使修改生效**：如需调整 `spec.worker.tieredStore`，需要删除并重新创建 CacheRuntime。
+- **如何使修改生效**：如需调整 `spec.worker.tieredStore`，需要删除并重新创建 CacheRuntime；调整 `spec.client.tieredStore` 需删除并重新创建 Client DaemonSet 或 CacheRuntime。
 
 ---
 
@@ -265,12 +265,13 @@ kubectl get cm fluid-runtime-class-snapshot-my-cache -o jsonpath='{.data.runtime
 | `resources` | ✅ 支持 | 自动同步到 AdvancedStatefulSet（重建 Pod） |
 | `replicas` | ✅ 支持 | 自动同步到 AdvancedStatefulSet（缩容会丢失该 Worker 上的缓存） |
 | `spec.worker.tieredStore` | ❌ 不支持 | 发生漂移时产生 `RuntimeTieredStoreConflict` Warning 事件；需删除并重新创建 CacheRuntime |
+| `spec.client.tieredStore` | ❌ 不支持 | 发生漂移时产生 `RuntimeTieredStoreConflict` Warning 事件；需删除并重新创建 Client DaemonSet 或 CacheRuntime |
 | 其他所有字段 | ❌ 不支持 | 不会同步，需重新部署 |
 
 **关键要点**：
 1. 当前版本支持 `runtimeVersion`、`resources` 和 `replicas` 三个字段的动态更新
 2. 仅通过 `runtimeVersion` 更新镜像时，受影响的容器在原 Pod 内重启，进程内存中的缓存会丢失，`emptyDir` 中的缓存会保留。修改 `resources` 会重建 Pod，两处缓存都会丢失。
 3. Cgroupv1 环境需分步更新 `runtimeVersion` 和 `resources`，`replicas` 不受此限制
-4. `spec.worker.tieredStore` 不支持原地更新；修改后会产生 Volume 配置漂移并触发 `RuntimeTieredStoreConflict` 告警事件，需删除并重新创建 CacheRuntime 生效
+4. `spec.worker.tieredStore` 和 `spec.client.tieredStore` 不支持原地更新；修改后会产生 Volume 配置漂移并触发 `RuntimeTieredStoreConflict` 告警事件，需删除并重新创建 CacheRuntime（或 Client DaemonSet）生效
 5. 其他字段的修改不会生效，必须重新部署
 6. CacheRuntime 绑定的是其首次部署时的 CacheRuntimeClass；修改 class 只影响之后创建的 CacheRuntime
